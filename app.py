@@ -212,23 +212,49 @@ def _is_preview_only(info: dict[str, Any]) -> bool:
 
 def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
     """Ищет полную (не Go+ 30с превью) версию трека на SoundCloud через yt-dlp."""
-    opts = {**base_ydl_opts(), "skip_download": True}
+    flat_opts = {
+        **base_ydl_opts(),
+        "noplaylist": False,
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+        "ignoreerrors": True,
+    }
     try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            res = ydl.extract_info(f"scsearch8:{query}", download=False)
+        with yt_dlp.YoutubeDL(flat_opts) as ydl:
+            res = ydl.extract_info(f"scsearch12:{query}", download=False)
     except Exception:
         return None
+
     entries = res.get("entries") if isinstance(res, dict) else []
-    for entry in entries or []:
-        if not isinstance(entry, dict):
+    probe_opts = {**base_ydl_opts(), "skip_download": True, "ignoreerrors": True}
+    checked = 0
+    for item in entries or []:
+        if not isinstance(item, dict):
             continue
-        dur = entry.get("duration")
+        url = str(item.get("url") or item.get("webpage_url") or "").strip()
+        if not url.startswith(("http://", "https://")):
+            continue
+        flat_dur = item.get("duration")
+        if isinstance(flat_dur, (int, float)) and (flat_dur <= 35 or flat_dur > MAX_DURATION_SEC):
+            continue
+        checked += 1
+        if checked > 6:
+            break
+        try:
+            with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                full = ydl.extract_info(url, download=False)
+        except Exception:
+            continue
+        if not isinstance(full, dict):
+            continue
+        dur = full.get("duration")
         if not isinstance(dur, (int, float)) or dur < 50 or dur > MAX_DURATION_SEC:
             continue
-        if _is_preview_only(entry):
+        if _is_preview_only(full):
             continue
-        if entry.get("webpage_url"):
-            return entry
+        if full.get("webpage_url") or url:
+            full.setdefault("webpage_url", url)
+            return full
     return None
 
 
