@@ -224,7 +224,7 @@ def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
     }
     try:
         with yt_dlp.YoutubeDL(flat_opts) as ydl:
-            res = ydl.extract_info(f"scsearch12:{query}", download=False)
+            res = ydl.extract_info(f"scsearch8:{query}", download=False)
     except Exception:
         return None
 
@@ -249,7 +249,7 @@ def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
     candidates.sort(key=lambda x: x[0])
 
     probe_opts = {**base_ydl_opts(), "skip_download": True, "ignoreerrors": True}
-    for _, url in candidates[:6]:
+    for _, url in candidates[:4]:
         try:
             with yt_dlp.YoutubeDL(probe_opts) as ydl:
                 full = ydl.extract_info(url, download=False)
@@ -329,7 +329,8 @@ def _transcode_to_mp3(
     cover_file: Path | None,
 ) -> None:
     already_mp3 = src_audio.suffix.lower() == ".mp3"
-    bitrate = "192k" if duration <= 600 else "128k"
+    # 128k + compression_level 9: ~2-3x быстрее на бесплатном 0.1 vCPU и легче для Telegram/Workers
+    bitrate = "128k"
     cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src_audio)]
     if cover_file and cover_file.is_file():
         cmd += [
@@ -351,7 +352,7 @@ def _transcode_to_mp3(
         cmd += [
             "-c:a", "libmp3lame",
             "-b:a", bitrate,
-            "-compression_level", "7",
+            "-compression_level", "9",
             "-ar", "44100",
         ]
 
