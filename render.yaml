@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: wf-music-service
+    runtime: docker
+    plan: free
+    region: frankfurt
+    healthCheckPath: /health
+    envVars:
+      - key: MUSIC_API_SECRET
+        generateValue: true
+      - key: MAX_CONCURRENT
+        value: "2"
+      - key: MAX_DURATION_SEC
+        value: "1200"
