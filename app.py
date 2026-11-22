@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+import time
 import urllib.request
 from urllib.parse import quote, urlparse
 
@@ -47,6 +48,8 @@ CHANNEL_SUFFIX_RE = re.compile(r"\s*(?:-\s*Topic|VEVO|Official)$", re.IGNORECASE
 
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 _cookie_path_cache: str | None = None
+_yt_blocked_until: float = 0.0
+PENALTY_WORDS = ("remix", "slowed", "sped up", "nightcore", "8d", "karaoke", "instrumental", "cover", "live")
 
 app = FastAPI(title="WF Music Service", version=APP_VERSION, docs_url=None, redoc_url=None)
 
@@ -211,7 +214,7 @@ def _is_preview_only(info: dict[str, Any]) -> bool:
 
 
 def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
-    """Ищет полную (не Go+ 30с превью) версию трека на SoundCloud через yt-dlp."""
+    """Ищет полную (не Go+ 30с превью) версию трека на SoundCloud через yt-dlp, предпочитая оригинал без ремиксов."""
     flat_opts = {
         **base_ydl_opts(),
         "noplaylist": False,
@@ -226,9 +229,11 @@ def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
         return None
 
     entries = res.get("entries") if isinstance(res, dict) else []
-    probe_opts = {**base_ydl_opts(), "skip_download": True, "ignoreerrors": True}
-    checked = 0
-    for item in entries or []:
+    q_lower = query.lower()
+
+    # Сначала проверяем треки без слов-штрафов (remix/slowed/cover), если их не было в самом запросе
+    candidates: list[tuple[int, str]] = []
+    for idx, item in enumerate(entries or []):
         if not isinstance(item, dict):
             continue
         url = str(item.get("url") or item.get("webpage_url") or "").strip()
@@ -237,9 +242,14 @@ def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
         flat_dur = item.get("duration")
         if isinstance(flat_dur, (int, float)) and (flat_dur <= 35 or flat_dur > MAX_DURATION_SEC):
             continue
-        checked += 1
-        if checked > 6:
-            break
+        title_l = f"{item.get('title') or ''} {url}".lower()
+        penalty = sum(1 for w in PENALTY_WORDS if w in title_l and w not in q_lower)
+        candidates.append((penalty * 100 + idx, url))
+
+    candidates.sort(key=lambda x: x[0])
+
+    probe_opts = {**base_ydl_opts(), "skip_download": True, "ignoreerrors": True}
+    for _, url in candidates[:6]:
         try:
             with yt_dlp.YoutubeDL(probe_opts) as ydl:
                 full = ydl.extract_info(url, download=False)
@@ -252,9 +262,8 @@ def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
             continue
         if _is_preview_only(full):
             continue
-        if full.get("webpage_url") or url:
-            full.setdefault("webpage_url", url)
-            return full
+        full.setdefault("webpage_url", url)
+        return full
     return None
 
 
@@ -319,6 +328,7 @@ def _transcode_to_mp3(
     duration: int,
     cover_file: Path | None,
 ) -> None:
+    already_mp3 = src_audio.suffix.lower() == ".mp3"
     bitrate = "192k" if duration <= 600 else "128k"
     cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src_audio)]
     if cover_file and cover_file.is_file():
@@ -334,10 +344,18 @@ def _transcode_to_mp3(
     else:
         cmd += ["-vn"]
 
+    if already_mp3:
+        # Исходник уже MP3 — ремуксим без перекодирования (<0.3 сек даже на 0.1 vCPU)
+        cmd += ["-c:a", "copy"]
+    else:
+        cmd += [
+            "-c:a", "libmp3lame",
+            "-b:a", bitrate,
+            "-compression_level", "7",
+            "-ar", "44100",
+        ]
+
     cmd += [
-        "-c:a", "libmp3lame",
-        "-b:a", bitrate,
-        "-ar", "44100",
         "-id3v2_version", "3",
         "-metadata", f"title={title}",
         "-metadata", f"artist={performer}",
@@ -374,6 +392,7 @@ def _download_sync(
     title_hint: str | None = None,
     performer_hint: str | None = None,
 ) -> tuple[bytes, dict[str, str]]:
+    global _yt_blocked_until
     if not shutil.which(FFMPEG_BIN):
         raise HTTPException(status_code=500, detail="FFmpeg не найден на сервере")
 
@@ -385,21 +404,27 @@ def _download_sync(
             canonical_key = f"yt:{yt_match.group(1)}"
 
         # 1. Получаем метаданные до скачивания — отсекаем стримы и слишком длинные ролики
-        probe_opts = {**base_ydl_opts(use_yt_alt_clients=True), "skip_download": True}
         info: dict[str, Any] | None = None
         actual_url = target_url
         bot_blocked = False
-        try:
-            with yt_dlp.YoutubeDL(probe_opts) as ydl:
-                extracted = ydl.extract_info(target_url, download=False)
-                if isinstance(extracted, dict):
-                    info = extracted
-        except yt_dlp.utils.DownloadError as exc:
-            msg = str(exc)
-            if "Sign in" in msg or "bot" in msg.lower() or "403" in msg:
-                bot_blocked = True
-            else:
-                raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
+        skip_yt_probe = bool(canonical_key) and not resolve_cookie_file() and time.monotonic() < _yt_blocked_until
+        if skip_yt_probe:
+            bot_blocked = True
+        else:
+            probe_opts = {**base_ydl_opts(use_yt_alt_clients=True), "skip_download": True}
+            try:
+                with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                    extracted = ydl.extract_info(target_url, download=False)
+                    if isinstance(extracted, dict):
+                        info = extracted
+            except yt_dlp.utils.DownloadError as exc:
+                msg = str(exc)
+                if "Sign in" in msg or "bot" in msg.lower() or "403" in msg:
+                    bot_blocked = True
+                    if canonical_key and not resolve_cookie_file():
+                        _yt_blocked_until = time.monotonic() + 1800
+                else:
+                    raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
 
         # Если YouTube ограничил облачный IP без cookies — ищем полную версию (не 30с превью) через SoundCloud в yt-dlp
         if bot_blocked or info is None:
@@ -432,10 +457,10 @@ def _download_sync(
             max_min = MAX_DURATION_SEC // 60
             raise HTTPException(status_code=422, detail=f"Трек слишком длинный (максимум {max_min} мин)")
 
-        # 2. Скачиваем лучшую аудиодорожку + обложку
+        # 2. Скачиваем лучшую аудиодорожку (для SoundCloud предпочитаем прогрессивный MP3 без перекодирования) + обложку
         dl_opts = {
             **base_ydl_opts(use_yt_alt_clients=(actual_url == target_url)),
-            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "format": "bestaudio[ext=mp3][protocol^=http]/bestaudio[ext=mp3]/bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": str(tmp_dir / "source.%(ext)s"),
             "writethumbnail": True,
             "max_filesize": 100 * 1024 * 1024,
