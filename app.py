@@ -1,0 +1,433 @@
+"""
+Микросервис поиска и скачивания полных аудиотреков через yt-dlp + FFmpeg для TG Chat Controller.
+Запускается бесплатно на Render (Docker), Hugging Face Spaces или локально + Cloudflare Tunnel.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import ipaddress
+import os
+import re
+import shutil
+import socket
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urlparse
+
+import yt_dlp
+from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, Field
+
+APP_VERSION = "1.0.0"
+
+MUSIC_API_SECRET = os.getenv("MUSIC_API_SECRET", "").strip()
+MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 минут
+MAX_FILE_BYTES = int(os.getenv("MAX_FILE_BYTES", str(45 * 1024 * 1024)))  # 45 МБ (лимит Telegram — 50 МБ)
+MAX_CONCURRENT = max(1, int(os.getenv("MAX_CONCURRENT", "2")))
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+
+VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+CLUTTER_RE = re.compile(
+    r"\s*[\(\[]\s*(?:"
+    r"official\s+(?:music\s+)?(?:video|audio|lyric\s+video|visualizer|mv)"
+    r"|lyric(?:s)?\s*(?:video)?|audio|hd|4k|hq|mv|премьера(?:\s+клипа|\s+трека)?|клип|официальн\w+\s+\w+"
+    r")\s*[\)\]]\s*",
+    re.IGNORECASE,
+)
+SEPARATOR_RE = re.compile(r"\s+(?:-|—|–)\s+")
+CHANNEL_SUFFIX_RE = re.compile(r"\s*(?:-\s*Topic|VEVO|Official)$", re.IGNORECASE)
+
+_semaphore = asyncio.Semaphore(MAX_CONCURRENT)
+_cookie_path_cache: str | None = None
+
+app = FastAPI(title="WF Music Service", version=APP_VERSION, docs_url=None, redoc_url=None)
+
+
+# ---------- авторизация ----------
+
+
+def require_auth(
+    x_music_secret: str | None = Header(default=None, alias="X-Music-Secret"),
+    authorization: str | None = Header(default=None),
+) -> None:
+    if not MUSIC_API_SECRET:
+        raise HTTPException(status_code=503, detail="MUSIC_API_SECRET не задан на сервере")
+    token = (x_music_secret or "").strip()
+    if not token and authorization and authorization.startswith("Bearer "):
+        token = authorization[7:].strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Нет токена авторизации")
+    if not hmac.compare_digest(token, MUSIC_API_SECRET):
+        raise HTTPException(status_code=403, detail="Неверный токен авторизации")
+
+
+# ---------- валидация и разбор метаданных ----------
+
+
+def resolve_cookie_file() -> str | None:
+    """Поддержка cookies.txt через YT_COOKIES_FILE или YT_COOKIES_B64 (если YouTube требует подтверждение на VPS)."""
+    global _cookie_path_cache
+    direct = os.getenv("YT_COOKIES_FILE", "").strip()
+    if direct and Path(direct).is_file():
+        return direct
+    b64 = os.getenv("YT_COOKIES_B64", "").strip()
+    if not b64:
+        return None
+    if _cookie_path_cache and Path(_cookie_path_cache).is_file():
+        return _cookie_path_cache
+    try:
+        raw = base64.b64decode(b64)
+        target = Path(tempfile.gettempdir()) / "wf_music_cookies.txt"
+        target.write_bytes(raw)
+        _cookie_path_cache = str(target)
+        return _cookie_path_cache
+    except Exception:
+        return None
+
+
+def validate_public_url(url: str) -> str:
+    """Проверяет, что ссылка публичная (http/https) и не ведёт на локальную сеть (защита от SSRF)."""
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise HTTPException(status_code=400, detail="Некорректная ссылка")
+
+    host = parsed.hostname.lower().rstrip(".")
+    if host in ("localhost",) or host.endswith(".local") or host.endswith(".internal"):
+        raise HTTPException(status_code=400, detail="Локальные адреса запрещены")
+
+    try:
+        ip = ipaddress.ip_address(host)
+        if not ip.is_global:
+            raise HTTPException(status_code=400, detail="Локальные IP-адреса запрещены")
+    except ValueError:
+        # Доменное имя — проверяем разрешённые IP (если DNS доступен)
+        try:
+            infos = socket.getaddrinfo(host, None)
+            for info in infos:
+                addr = ipaddress.ip_address(info[4][0])
+                if not addr.is_global:
+                    raise HTTPException(status_code=400, detail="Ссылка ведёт на внутренний адрес")
+        except HTTPException:
+            raise
+        except OSError:
+            pass
+
+    return url.strip()
+
+
+def clean_title_noise(text: str) -> str:
+    cleaned = CLUTTER_RE.sub(" ", text).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -—–|")
+    return cleaned or text.strip()
+
+
+def split_artist_title(
+    raw_title: str,
+    uploader: str | None = None,
+    artist_meta: str | None = None,
+    track_meta: str | None = None,
+) -> tuple[str, str]:
+    """Определяет (performer, title) для тегов MP3 и плеера Telegram."""
+    if artist_meta and track_meta:
+        return artist_meta.strip()[:64], clean_title_noise(track_meta)[:64]
+
+    cleaned = clean_title_noise(raw_title)
+    parts = SEPARATOR_RE.split(cleaned, maxsplit=1)
+    if len(parts) == 2 and parts[0].strip() and parts[1].strip():
+        return parts[0].strip()[:64], parts[1].strip()[:64]
+
+    performer = CHANNEL_SUFFIX_RE.sub("", (uploader or "")).strip() or "Неизвестный исполнитель"
+    return performer[:64], (cleaned or "Без названия")[:64]
+
+
+def track_key_for(info: dict[str, Any], fallback_url: str) -> str:
+    extractor = str(info.get("extractor_key") or info.get("ie_key") or "").lower()
+    vid = str(info.get("id") or "")
+    if "youtube" in extractor and VIDEO_ID_RE.match(vid):
+        return f"yt:{vid}"
+    canonical = str(info.get("webpage_url") or fallback_url)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:24]
+    return f"url:{digest}"
+
+
+def best_thumbnail_url(info: dict[str, Any]) -> str:
+    vid = str(info.get("id") or "")
+    extractor = str(info.get("extractor_key") or info.get("ie_key") or "").lower()
+    if "youtube" in extractor and VIDEO_ID_RE.match(vid):
+        return f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg"
+    thumb = info.get("thumbnail")
+    if isinstance(thumb, str) and thumb.startswith(("http://", "https://")):
+        return thumb
+    thumbs = info.get("thumbnails")
+    if isinstance(thumbs, list):
+        for t in reversed(thumbs):
+            u = t.get("url") if isinstance(t, dict) else None
+            if isinstance(u, str) and u.startswith(("http://", "https://")):
+                return u
+    return ""
+
+
+def base_ydl_opts() -> dict[str, Any]:
+    opts: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 15,
+        "retries": 2,
+    }
+    cookiefile = resolve_cookie_file()
+    if cookiefile:
+        opts["cookiefile"] = cookiefile
+    return opts
+
+
+# ---------- yt-dlp + FFmpeg ----------
+
+
+def _search_sync(query: str, limit: int) -> list[dict[str, Any]]:
+    fetch_count = min(15, max(limit + 3, 8))
+    opts = {
+        **base_ydl_opts(),
+        "extract_flat": "in_playlist",
+        "skip_download": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        res = ydl.extract_info(f"ytsearch{fetch_count}:{query}", download=False)
+
+    entries = res.get("entries") if isinstance(res, dict) else []
+    tracks: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        vid = str(entry.get("id") or "")
+        if not VIDEO_ID_RE.match(vid) or vid in seen_ids:
+            continue
+        if entry.get("live_status") == "is_live" or entry.get("is_live"):
+            continue
+        dur = entry.get("duration")
+        duration = int(dur) if isinstance(dur, (int, float)) and dur > 0 else 0
+        if duration > MAX_DURATION_SEC:
+            continue
+
+        raw_title = str(entry.get("title") or "").strip()
+        if not raw_title:
+            continue
+        uploader = str(entry.get("channel") or entry.get("uploader") or "").strip()
+        performer, title = split_artist_title(raw_title, uploader)
+        seen_ids.add(vid)
+        tracks.append(
+            {
+                "id": f"yt:{vid}",
+                "videoId": vid,
+                "title": title,
+                "performer": performer,
+                "duration": duration,
+                "url": f"https://www.youtube.com/watch?v={vid}",
+                "thumbnail": f"https://i.ytimg.com/vi/{vid}/hqdefault.jpg",
+            }
+        )
+        if len(tracks) >= limit:
+            break
+
+    return tracks
+
+
+def _transcode_to_mp3(
+    src_audio: Path,
+    dst_mp3: Path,
+    title: str,
+    performer: str,
+    duration: int,
+    cover_file: Path | None,
+) -> None:
+    bitrate = "192k" if duration <= 600 else "128k"
+    cmd = [FFMPEG_BIN, "-y", "-hide_banner", "-loglevel", "error", "-i", str(src_audio)]
+    if cover_file and cover_file.is_file():
+        cmd += [
+            "-i", str(cover_file),
+            "-map", "0:a:0",
+            "-map", "1:v:0",
+            "-c:v", "mjpeg",
+            "-vf", "crop='min(iw,ih)':'min(iw,ih)',scale=320:320",
+            "-metadata:s:v", "title=Album cover",
+            "-metadata:s:v", "comment=Cover (front)",
+        ]
+    else:
+        cmd += ["-vn"]
+
+    cmd += [
+        "-c:a", "libmp3lame",
+        "-b:a", bitrate,
+        "-ar", "44100",
+        "-id3v2_version", "3",
+        "-metadata", f"title={title}",
+        "-metadata", f"artist={performer}",
+        str(dst_mp3),
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+    if proc.returncode != 0 or not dst_mp3.is_file():
+        # Если обложка была битой (например, webp без декодера) — повторяем конвертацию только аудио
+        if cover_file is not None:
+            _transcode_to_mp3(src_audio, dst_mp3, title, performer, duration, None)
+            return
+        raise RuntimeError(f"FFmpeg error: {proc.stderr.strip()[:200]}")
+
+
+def _download_sync(
+    target_url: str,
+    title_hint: str | None = None,
+    performer_hint: str | None = None,
+) -> tuple[bytes, dict[str, str]]:
+    if not shutil.which(FFMPEG_BIN):
+        raise HTTPException(status_code=500, detail="FFmpeg не найден на сервере")
+
+    with tempfile.TemporaryDirectory(prefix="wf_music_") as tmp:
+        tmp_dir = Path(tmp)
+
+        # 1. Получаем метаданные до скачивания — отсекаем стримы и слишком длинные ролики
+        probe_opts = {**base_ydl_opts(), "skip_download": True}
+        try:
+            with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                info = ydl.extract_info(target_url, download=False)
+        except yt_dlp.utils.DownloadError as exc:
+            msg = str(exc)
+            if "Sign in" in msg or "bot" in msg.lower():
+                raise HTTPException(status_code=503, detail="YouTube временно ограничил загрузку. Попробуй позже.")
+            raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
+
+        if not isinstance(info, dict):
+            raise HTTPException(status_code=404, detail="Трек не найден")
+        if info.get("is_live") or info.get("live_status") == "is_live":
+            raise HTTPException(status_code=422, detail="Прямые трансляции нельзя скачать как песню")
+
+        dur = info.get("duration")
+        duration = int(dur) if isinstance(dur, (int, float)) and dur > 0 else 0
+        if duration > MAX_DURATION_SEC:
+            max_min = MAX_DURATION_SEC // 60
+            raise HTTPException(status_code=422, detail=f"Трек слишком длинный (максимум {max_min} мин)")
+
+        # 2. Скачиваем лучшую аудиодорожку + обложку
+        dl_opts = {
+            **base_ydl_opts(),
+            "format": "bestaudio[ext=m4a]/bestaudio/best",
+            "outtmpl": str(tmp_dir / "source.%(ext)s"),
+            "writethumbnail": True,
+            "max_filesize": 100 * 1024 * 1024,
+        }
+        try:
+            with yt_dlp.YoutubeDL(dl_opts) as ydl:
+                ydl.download([target_url])
+        except yt_dlp.utils.DownloadError:
+            raise HTTPException(status_code=502, detail="Не получилось скачать аудиодорожку")
+
+        audio_files = [
+            p for p in tmp_dir.iterdir()
+            if p.is_file() and p.name.startswith("source.") and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".part")
+        ]
+        if not audio_files:
+            raise HTTPException(status_code=502, detail="Аудиофайл не скачался")
+        src_audio = audio_files[0]
+
+        cover_files = [
+            p for p in tmp_dir.iterdir()
+            if p.is_file() and p.name.startswith("source.") and p.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp")
+        ]
+        cover_file = cover_files[0] if cover_files else None
+
+        performer, title = split_artist_title(
+            str(info.get("title") or ""),
+            str(info.get("channel") or info.get("uploader") or ""),
+            artist_meta=info.get("artist") or info.get("creator"),
+            track_meta=info.get("track"),
+        )
+        if title_hint and title == "Без названия":
+            title = title_hint[:64]
+        if performer_hint and performer == "Неизвестный исполнитель":
+            performer = performer_hint[:64]
+
+        # 3. Конвертируем через FFmpeg в MP3 с ID3v2.3 тегами и обложкой
+        dst_mp3 = tmp_dir / "track.mp3"
+        try:
+            _transcode_to_mp3(src_audio, dst_mp3, title, performer, duration, cover_file)
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=f"Ошибка FFmpeg: {exc}")
+
+        data = dst_mp3.read_bytes()
+        if len(data) == 0:
+            raise HTTPException(status_code=500, detail="Пустой MP3 после конвертации")
+        if len(data) > MAX_FILE_BYTES:
+            raise HTTPException(status_code=422, detail="Файл получился больше 45 МБ — Telegram его не примет")
+
+        headers = {
+            "X-Track-Key": quote(track_key_for(info, target_url), safe=":"),
+            "X-Track-Title": quote(title, safe=""),
+            "X-Track-Performer": quote(performer, safe=""),
+            "X-Track-Duration": str(duration),
+            "X-Track-Url": quote(str(info.get("webpage_url") or target_url), safe=":/?&=%"),
+            "X-Track-Thumb": quote(best_thumbnail_url(info), safe=":/?&=%"),
+        }
+        return data, headers
+
+
+# ---------- схемы и маршруты ----------
+
+
+class SearchRequest(BaseModel):
+    query: str = Field(..., min_length=1, max_length=200)
+    limit: int = Field(default=5, ge=1, le=10)
+
+
+class DownloadRequest(BaseModel):
+    id: str | None = None
+    url: str | None = None
+    title: str | None = None
+    performer: str | None = None
+
+
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return {
+        "ok": True,
+        "version": APP_VERSION,
+        "yt_dlp": yt_dlp.version.__version__,
+        "ffmpeg": bool(shutil.which(FFMPEG_BIN)),
+    }
+
+
+@app.post("/search", dependencies=[Depends(require_auth)])
+async def search(req: SearchRequest) -> JSONResponse:
+    query = req.query.strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Пустой запрос")
+    async with _semaphore:
+        tracks = await asyncio.to_thread(_search_sync, query, req.limit)
+    return JSONResponse({"tracks": tracks})
+
+
+@app.post("/download", dependencies=[Depends(require_auth)])
+async def download(req: DownloadRequest) -> Response:
+    if req.id:
+        vid = req.id.removeprefix("yt:").strip()
+        if not VIDEO_ID_RE.match(vid):
+            raise HTTPException(status_code=400, detail="Некорректный ID трека")
+        target_url = f"https://www.youtube.com/watch?v={vid}"
+    elif req.url:
+        target_url = validate_public_url(req.url)
+    else:
+        raise HTTPException(status_code=400, detail="Нужно указать id или url")
+
+    async with _semaphore:
+        audio_bytes, headers = await asyncio.to_thread(
+            _download_sync, target_url, req.title, req.performer
+        )
+
+    return Response(content=audio_bytes, media_type="audio/mpeg", headers=headers)
