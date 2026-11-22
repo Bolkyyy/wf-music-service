@@ -18,6 +18,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 from typing import Any
+import urllib.request
 from urllib.parse import quote, urlparse
 
 import yt_dlp
@@ -174,7 +175,7 @@ def best_thumbnail_url(info: dict[str, Any]) -> str:
     return ""
 
 
-def base_ydl_opts() -> dict[str, Any]:
+def base_ydl_opts(use_yt_alt_clients: bool = False) -> dict[str, Any]:
     opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
@@ -185,7 +186,50 @@ def base_ydl_opts() -> dict[str, Any]:
     cookiefile = resolve_cookie_file()
     if cookiefile:
         opts["cookiefile"] = cookiefile
+    elif use_yt_alt_clients:
+        # На облачных IP (Render/AWS) без cookies альтернативные клиенты YouTube реже упираются в bot-check
+        opts["extractor_args"] = {"youtube": {"player_client": ["android_vr", "tv_downgraded", "ios", "web"]}}
     return opts
+
+
+def _is_preview_only(info: dict[str, Any]) -> bool:
+    """Отсекает 30-секундные SoundCloud Go+ превью, чтобы отдавать только полные треки."""
+    dur = info.get("duration")
+    if isinstance(dur, (int, float)) and 0 < dur <= 35:
+        return True
+    formats = info.get("formats")
+    if isinstance(formats, list) and formats:
+        non_preview = [
+            f for f in formats
+            if isinstance(f, dict)
+            and "preview" not in str(f.get("format_id") or "").lower()
+            and "/preview/" not in str(f.get("url") or "").lower()
+        ]
+        if not non_preview:
+            return True
+    return False
+
+
+def _find_soundcloud_full_url(query: str) -> dict[str, Any] | None:
+    """Ищет полную (не Go+ 30с превью) версию трека на SoundCloud через yt-dlp."""
+    opts = {**base_ydl_opts(), "skip_download": True}
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            res = ydl.extract_info(f"scsearch8:{query}", download=False)
+    except Exception:
+        return None
+    entries = res.get("entries") if isinstance(res, dict) else []
+    for entry in entries or []:
+        if not isinstance(entry, dict):
+            continue
+        dur = entry.get("duration")
+        if not isinstance(dur, (int, float)) or dur < 50 or dur > MAX_DURATION_SEC:
+            continue
+        if _is_preview_only(entry):
+            continue
+        if entry.get("webpage_url"):
+            return entry
+    return None
 
 
 # ---------- yt-dlp + FFmpeg ----------
@@ -282,6 +326,23 @@ def _transcode_to_mp3(
         raise RuntimeError(f"FFmpeg error: {proc.stderr.strip()[:200]}")
 
 
+def _youtube_oembed(url: str) -> tuple[str, str] | None:
+    """Быстрый fallback для названия/автора YouTube (oEmbed не блокируется на облачных IP)."""
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json"
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            import json
+            data = json.loads(resp.read().decode("utf-8", errors="replace"))
+        raw_title = str(data.get("title") or "").strip()
+        author = str(data.get("author_name") or "").strip()
+        if raw_title:
+            return split_artist_title(raw_title, author)
+    except Exception:
+        return None
+    return None
+
+
 def _download_sync(
     target_url: str,
     title_hint: str | None = None,
@@ -292,20 +353,50 @@ def _download_sync(
 
     with tempfile.TemporaryDirectory(prefix="wf_music_") as tmp:
         tmp_dir = Path(tmp)
+        canonical_key: str | None = None
+        yt_match = re.search(r"[?&]v=([A-Za-z0-9_-]{11})", target_url)
+        if yt_match:
+            canonical_key = f"yt:{yt_match.group(1)}"
 
         # 1. Получаем метаданные до скачивания — отсекаем стримы и слишком длинные ролики
-        probe_opts = {**base_ydl_opts(), "skip_download": True}
+        probe_opts = {**base_ydl_opts(use_yt_alt_clients=True), "skip_download": True}
+        info: dict[str, Any] | None = None
+        actual_url = target_url
+        bot_blocked = False
         try:
             with yt_dlp.YoutubeDL(probe_opts) as ydl:
-                info = ydl.extract_info(target_url, download=False)
+                extracted = ydl.extract_info(target_url, download=False)
+                if isinstance(extracted, dict):
+                    info = extracted
         except yt_dlp.utils.DownloadError as exc:
             msg = str(exc)
-            if "Sign in" in msg or "bot" in msg.lower():
-                raise HTTPException(status_code=503, detail="YouTube временно ограничил загрузку. Попробуй позже.")
-            raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
+            if "Sign in" in msg or "bot" in msg.lower() or "403" in msg:
+                bot_blocked = True
+            else:
+                raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
 
-        if not isinstance(info, dict):
-            raise HTTPException(status_code=404, detail="Трек не найден")
+        # Если YouTube ограничил облачный IP без cookies — ищем полную версию (не 30с превью) через SoundCloud в yt-dlp
+        if bot_blocked or info is None:
+            p_hint, t_hint = (performer_hint or "").strip(), (title_hint or "").strip()
+            if (not t_hint or not p_hint) and canonical_key:
+                oe = _youtube_oembed(target_url)
+                if oe:
+                    p_hint = p_hint or oe[0]
+                    t_hint = t_hint or oe[1]
+            sc_query = f"{p_hint} {t_hint}".strip()
+            sc_entry = _find_soundcloud_full_url(sc_query) if sc_query else None
+            if sc_entry and sc_entry.get("webpage_url"):
+                info = sc_entry
+                actual_url = str(sc_entry["webpage_url"])
+                if not title_hint and t_hint:
+                    title_hint = t_hint
+                if not performer_hint and p_hint:
+                    performer_hint = p_hint
+            elif bot_blocked:
+                raise HTTPException(status_code=503, detail="YouTube временно ограничил загрузку. Попробуй позже.")
+            else:
+                raise HTTPException(status_code=404, detail="Трек не найден")
+
         if info.get("is_live") or info.get("live_status") == "is_live":
             raise HTTPException(status_code=422, detail="Прямые трансляции нельзя скачать как песню")
 
@@ -317,7 +408,7 @@ def _download_sync(
 
         # 2. Скачиваем лучшую аудиодорожку + обложку
         dl_opts = {
-            **base_ydl_opts(),
+            **base_ydl_opts(use_yt_alt_clients=(actual_url == target_url)),
             "format": "bestaudio[ext=m4a]/bestaudio/best",
             "outtmpl": str(tmp_dir / "source.%(ext)s"),
             "writethumbnail": True,
@@ -325,7 +416,7 @@ def _download_sync(
         }
         try:
             with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                ydl.download([target_url])
+                ydl.download([actual_url])
         except yt_dlp.utils.DownloadError:
             raise HTTPException(status_code=502, detail="Не получилось скачать аудиодорожку")
 
@@ -349,10 +440,14 @@ def _download_sync(
             artist_meta=info.get("artist") or info.get("creator"),
             track_meta=info.get("track"),
         )
-        if title_hint and title == "Без названия":
+        if actual_url != target_url and title_hint and performer_hint:
             title = title_hint[:64]
-        if performer_hint and performer == "Неизвестный исполнитель":
             performer = performer_hint[:64]
+        else:
+            if title_hint and title == "Без названия":
+                title = title_hint[:64]
+            if performer_hint and performer == "Неизвестный исполнитель":
+                performer = performer_hint[:64]
 
         # 3. Конвертируем через FFmpeg в MP3 с ID3v2.3 тегами и обложкой
         dst_mp3 = tmp_dir / "track.mp3"
@@ -368,11 +463,11 @@ def _download_sync(
             raise HTTPException(status_code=422, detail="Файл получился больше 45 МБ — Telegram его не примет")
 
         headers = {
-            "X-Track-Key": quote(track_key_for(info, target_url), safe=":"),
+            "X-Track-Key": quote(canonical_key or track_key_for(info, target_url), safe=":"),
             "X-Track-Title": quote(title, safe=""),
             "X-Track-Performer": quote(performer, safe=""),
             "X-Track-Duration": str(duration),
-            "X-Track-Url": quote(str(info.get("webpage_url") or target_url), safe=":/?&=%"),
+            "X-Track-Url": quote(str(info.get("webpage_url") or actual_url), safe=":/?&=%"),
             "X-Track-Thumb": quote(best_thumbnail_url(info), safe=":/?&=%"),
         }
         return data, headers
