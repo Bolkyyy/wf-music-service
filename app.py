@@ -35,7 +35,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.0.1"
 
 MUSIC_API_SECRET = os.getenv("MUSIC_API_SECRET", "").strip()
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 минут
@@ -338,9 +338,14 @@ def _search_soundcloud_sync(query: str, limit: int) -> list[dict[str, Any]]:
         url = str(entry.get("url") or entry.get("webpage_url") or "").strip()
         if not SC_ID_RE.match(tid) or tid in seen_ids or not url.startswith(("http://", "https://")):
             continue
+        # Отсекаем Go+ превью (SNIP), заблокированные по региону (BLOCK) и слишком длинные сеты (>20 мин)
+        policy = str(entry.get("policy") or "").upper()
+        if policy in ("SNIP", "BLOCK"):
+            continue
+        if str(entry.get("monetization_model") or "").upper() == "SUB_HIGH_TIER":
+            continue
         dur = entry.get("duration")
         duration = int(dur) if isinstance(dur, (int, float)) and dur > 0 else 0
-        # Отсекаем 30-секундные Go+ превью и слишком длинные сеты (>20 мин)
         if duration <= 45 or duration > MAX_DURATION_SEC:
             continue
         raw_title = str(entry.get("title") or "").strip()
@@ -627,6 +632,9 @@ def _download_sync(
                     bot_blocked = True
                     if is_yt_url and not resolve_cookie_file():
                         _yt_blocked_until = time.monotonic() + 1800
+                elif title_hint or performer_hint:
+                    # Например, трек SoundCloud оказался Go+/геоблоком — ниже подберём рабочую полную копию
+                    info = None
                 else:
                     raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
 
