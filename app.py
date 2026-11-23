@@ -35,7 +35,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2.0.1"
+APP_VERSION = "2.0.2"
 
 MUSIC_API_SECRET = os.getenv("MUSIC_API_SECRET", "").strip()
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 минут
@@ -59,6 +59,21 @@ CLUTTER_RE = re.compile(
 SEPARATOR_RE = re.compile(r"\s+(?:-|—|–)\s+")
 CHANNEL_SUFFIX_RE = re.compile(r"\s*(?:-\s*Topic|VEVO|Official)$", re.IGNORECASE)
 PENALTY_WORDS = ("remix", "slowed", "sped up", "nightcore", "8d", "karaoke", "instrumental", "cover", "live", "mashup")
+TRANSLIT_RU = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "e", "ж": "zh", "з": "z",
+    "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "kh", "ц": "ts", "ч": "ch", "ш": "sh",
+    "щ": "shch", "ъ": "", "ы": "y", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+}
+
+
+def translit_ru_to_lat(text: str) -> str:
+    return "".join(TRANSLIT_RU.get(ch, ch) for ch in text.lower())
+
+
+def clean_query_text(text: str) -> str:
+    cleaned = re.sub(r"[—–\-/\\|()\[\]{}«»\"']+", " ", text)
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 _semaphore = asyncio.Semaphore(MAX_CONCURRENT)
 _cookie_path_cache: str | None = None
@@ -434,14 +449,31 @@ def _search_sync(query: str, limit: int) -> list[dict[str, Any]]:
             return yt
         return _search_soundcloud_sync(query, limit)
 
-    sc = _search_soundcloud_sync(query, limit)
+    cleaned = clean_query_text(query) or query
+    sc = _search_soundcloud_sync(cleaned, limit)
     if sc:
         return sc
+    # Если кириллический запрос не нашёлся на SoundCloud — пробуем транслит (например, «Моргенштерн» -> «morgenshtern»)
+    lat = translit_ru_to_lat(cleaned)
+    if lat and lat != cleaned.lower():
+        sc_lat = _search_soundcloud_sync(lat, limit)
+        if sc_lat:
+            return sc_lat
     return _search_youtube_sync(query, limit)
 
 
-def _find_soundcloud_full_url(query: str, exclude_url: str = "") -> dict[str, Any] | None:
-    """Ищет полную (не Go+ 30с превью) версию трека на SoundCloud через yt-dlp."""
+def _find_soundcloud_full_url(query: str, exclude_url: str = "", title_only: str = "") -> dict[str, Any] | None:
+    """Ищет полную (не Go+ 30с превью) версию трека на SoundCloud через yt-dlp (оригинал + транслит + без канала)."""
+    raw_queries: list[str] = []
+    for candidate in (clean_query_text(query), clean_query_text(title_only)):
+        if not candidate:
+            continue
+        if candidate not in raw_queries:
+            raw_queries.append(candidate)
+        lat = translit_ru_to_lat(candidate)
+        if lat and lat != candidate.lower() and lat not in raw_queries:
+            raw_queries.append(lat)
+
     flat_opts = {
         **base_ydl_opts(),
         "noplaylist": False,
@@ -449,44 +481,49 @@ def _find_soundcloud_full_url(query: str, exclude_url: str = "") -> dict[str, An
         "skip_download": True,
         "ignoreerrors": True,
     }
-    try:
-        with yt_dlp.YoutubeDL(flat_opts) as ydl:
-            res = ydl.extract_info(f"scsearch8:{query}", download=False)
-    except Exception:
-        return None
-
-    entries = res.get("entries") if isinstance(res, dict) else []
-    q_lower = query.lower()
-    candidates: list[tuple[int, str]] = []
-    for idx, item in enumerate(entries or []):
-        if not isinstance(item, dict):
-            continue
-        url = str(item.get("url") or item.get("webpage_url") or "").strip()
-        if not url.startswith(("http://", "https://")) or url == exclude_url:
-            continue
-        flat_dur = item.get("duration")
-        if isinstance(flat_dur, (int, float)) and (flat_dur <= 45 or flat_dur > MAX_DURATION_SEC):
-            continue
-        penalty = _penalty_score(f"{item.get('title') or ''} {url}", q_lower)
-        candidates.append((penalty * 100 + idx, url))
-
-    candidates.sort(key=lambda x: x[0])
     probe_opts = {**base_ydl_opts(), "skip_download": True, "ignoreerrors": True}
-    for _, url in candidates[:4]:
+
+    for q in raw_queries[:3]:
         try:
-            with yt_dlp.YoutubeDL(probe_opts) as ydl:
-                full = ydl.extract_info(url, download=False)
+            with yt_dlp.YoutubeDL(flat_opts) as ydl:
+                res = ydl.extract_info(f"scsearch8:{q}", download=False)
         except Exception:
             continue
-        if not isinstance(full, dict):
-            continue
-        dur = full.get("duration")
-        if not isinstance(dur, (int, float)) or dur < 50 or dur > MAX_DURATION_SEC:
-            continue
-        if _is_preview_only(full):
-            continue
-        full.setdefault("webpage_url", url)
-        return full
+
+        entries = res.get("entries") if isinstance(res, dict) else []
+        q_lower = q.lower()
+        candidates: list[tuple[int, str]] = []
+        for idx, item in enumerate(entries or []):
+            if not isinstance(item, dict):
+                continue
+            policy = str(item.get("policy") or "").upper()
+            if policy in ("SNIP", "BLOCK"):
+                continue
+            url = str(item.get("url") or item.get("webpage_url") or "").strip()
+            if not url.startswith(("http://", "https://")) or url == exclude_url:
+                continue
+            flat_dur = item.get("duration")
+            if isinstance(flat_dur, (int, float)) and (flat_dur <= 45 or flat_dur > MAX_DURATION_SEC):
+                continue
+            penalty = _penalty_score(f"{item.get('title') or ''} {url}", q_lower)
+            candidates.append((penalty * 100 + idx, url))
+
+        candidates.sort(key=lambda x: x[0])
+        for _, url in candidates[:3]:
+            try:
+                with yt_dlp.YoutubeDL(probe_opts) as ydl:
+                    full = ydl.extract_info(url, download=False)
+            except Exception:
+                continue
+            if not isinstance(full, dict):
+                continue
+            dur = full.get("duration")
+            if not isinstance(dur, (int, float)) or dur < 50 or dur > MAX_DURATION_SEC:
+                continue
+            if _is_preview_only(full):
+                continue
+            full.setdefault("webpage_url", url)
+            return full
     return None
 
 
@@ -656,7 +693,7 @@ def _download_sync(
                     t_hint = t_hint or oe[1]
             update_job(status="probing", percent=22, stage="Подбираю полную версию…", eta=6)
             sc_query = f"{p_hint} {t_hint}".strip()
-            sc_entry = _find_soundcloud_full_url(sc_query, exclude_url=target_url) if sc_query else None
+            sc_entry = _find_soundcloud_full_url(sc_query, exclude_url=target_url, title_only=t_hint) if (sc_query or t_hint) else None
             if sc_entry and sc_entry.get("webpage_url"):
                 info = sc_entry
                 actual_url = str(sc_entry["webpage_url"])
@@ -665,7 +702,10 @@ def _download_sync(
                 if not performer_hint and p_hint:
                     performer_hint = p_hint
             elif bot_blocked:
-                raise HTTPException(status_code=503, detail="YouTube временно ограничил загрузку. Попробуй другое название.")
+                raise HTTPException(
+                    status_code=503,
+                    detail="YouTube ограничил скачивание с облачного сервера, а полной копии на SoundCloud не нашлось. Попробуй другое название.",
+                )
             elif info is None:
                 raise HTTPException(status_code=404, detail="Трек не найден")
             else:
