@@ -35,7 +35,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2.1.0"
+APP_VERSION = "2.1.1"
 
 MUSIC_API_SECRET = os.getenv("MUSIC_API_SECRET", "").strip()
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 минут
@@ -647,105 +647,13 @@ def _download_sync(
         if not canonical_key and yt_match:
             canonical_key = f"yt:{yt_match.group(1)}"
 
-        # 1. Получаем метаданные до скачивания
+        # 1. Один проход yt-dlp (метаданные + скачивание за один вызов, чтобы Deno EJS не запускался дважды!)
         info: dict[str, Any] | None = None
         actual_url = target_url
         bot_blocked = False
+        filter_rejection: dict[str, str] = {}
         is_yt_url = bool(yt_match)
         skip_yt_probe = is_yt_url and not resolve_cookie_file() and time.monotonic() < _yt_blocked_until
-
-        if skip_yt_probe:
-            bot_blocked = True
-        else:
-            probe_opts = {**base_ydl_opts(use_yt_alt_clients=is_yt_url), "skip_download": True}
-            try:
-                with yt_dlp.YoutubeDL(probe_opts) as ydl:
-                    extracted = ydl.extract_info(target_url, download=False)
-                    if isinstance(extracted, dict):
-                        info = extracted
-            except yt_dlp.utils.DownloadError as exc:
-                msg = str(exc)
-                if "Sign in" in msg or "bot" in msg.lower() or "403" in msg:
-                    bot_blocked = True
-                    if is_yt_url and not resolve_cookie_file():
-                        _yt_blocked_until = time.monotonic() + 1800
-                elif title_hint or performer_hint:
-                    # Например, трек SoundCloud оказался Go+/геоблоком — ниже подберём рабочую полную копию
-                    info = None
-                else:
-                    raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
-
-        # Если трек с SoundCloud оказался 30с Go+ превью или YouTube заблокировал IP — ищем полную версию на SoundCloud
-        need_sc_fallback = bot_blocked or info is None or (isinstance(info, dict) and _is_preview_only(info))
-        if need_sc_fallback:
-            p_hint, t_hint = (performer_hint or "").strip(), (title_hint or "").strip()
-            if (not t_hint or not p_hint) and isinstance(info, dict):
-                p2, t2 = split_artist_title(
-                    str(info.get("title") or ""),
-                    str(info.get("channel") or info.get("uploader") or ""),
-                )
-                p_hint = p_hint or p2
-                t_hint = t_hint or t2
-            if (not t_hint or not p_hint) and is_yt_url:
-                oe = _youtube_oembed(target_url)
-                if oe:
-                    p_hint = p_hint or oe[0]
-                    t_hint = t_hint or oe[1]
-            update_job(status="probing", percent=22, stage="Подбираю полную версию…", eta=6)
-            sc_query = f"{p_hint} {t_hint}".strip()
-            sc_entry = _find_soundcloud_full_url(sc_query, exclude_url=target_url, title_only=t_hint) if (sc_query or t_hint) else None
-            if sc_entry and sc_entry.get("webpage_url"):
-                info = sc_entry
-                actual_url = str(sc_entry["webpage_url"])
-                if not title_hint and t_hint:
-                    title_hint = t_hint
-                if not performer_hint and p_hint:
-                    performer_hint = p_hint
-            elif bot_blocked:
-                raise HTTPException(
-                    status_code=503,
-                    detail="YouTube ограничил скачивание с облачного сервера, а полной копии на SoundCloud не нашлось. Попробуй другое название.",
-                )
-            elif info is None:
-                raise HTTPException(status_code=404, detail="Трек не найден")
-            else:
-                raise HTTPException(status_code=422, detail="Доступно только 30-секундное превью — попробуй другой вариант")
-
-        if info.get("is_live") or info.get("live_status") == "is_live":
-            raise HTTPException(status_code=422, detail="Прямые трансляции нельзя скачать как песню")
-
-        dur = info.get("duration")
-        duration = int(dur) if isinstance(dur, (int, float)) and dur > 0 else 0
-        if duration > MAX_DURATION_SEC:
-            max_min = MAX_DURATION_SEC // 60
-            raise HTTPException(status_code=422, detail=f"Трек слишком длинный (максимум {max_min} мин)")
-
-        performer, title = split_artist_title(
-            str(info.get("title") or ""),
-            str(info.get("channel") or info.get("uploader") or ""),
-            artist_meta=info.get("artist") or info.get("creator"),
-            track_meta=info.get("track"),
-        )
-        if actual_url != target_url and title_hint and performer_hint:
-            title = title_hint[:64]
-            performer = performer_hint[:64]
-        else:
-            if title_hint and title == "Без названия":
-                title = title_hint[:64]
-            if performer_hint and performer == "Неизвестный исполнитель":
-                performer = performer_hint[:64]
-
-        update_job(
-            status="downloading",
-            percent=28,
-            stage="Скачиваю аудио…",
-            title=title,
-            performer=performer,
-            duration=duration,
-            eta=5,
-        )
-
-        # 2. Скачиваем аудио с параллельной загрузкой HLS-фрагментов и реальным прогресс-хуком
         dl_started = time.monotonic()
 
         def on_progress(d: dict[str, Any]) -> None:
@@ -761,15 +669,15 @@ def _download_sync(
                     frag_cnt = d.get("fragment_count")
                     if isinstance(frag_idx, (int, float)) and isinstance(frag_cnt, (int, float)) and frag_cnt > 0:
                         frac = min(1.0, frag_idx / frag_cnt)
-                pct = min(82, max(28, int(28 + frac * 54)))
+                pct = min(84, max(35, int(35 + frac * 49)))
                 raw_eta = d.get("eta")
                 if isinstance(raw_eta, (int, float)) and raw_eta >= 0:
-                    eta_sec = max(1, int(raw_eta) + 2)
+                    eta_sec = max(1, int(raw_eta) + 1)
                 elif frac > 0.05:
                     elapsed = max(0.5, time.monotonic() - dl_started)
-                    eta_sec = max(1, int(elapsed * (1.0 - frac) / frac) + 2)
+                    eta_sec = max(1, int(elapsed * (1.0 - frac) / frac) + 1)
                 else:
-                    eta_sec = 5
+                    eta_sec = 4
                 update_job(
                     status="downloading",
                     percent=pct,
@@ -779,37 +687,151 @@ def _download_sync(
                     stage="Скачиваю аудио…",
                 )
             elif st == "finished":
-                update_job(status="converting", percent=85, stage="Упаковываю FFmpeg…", eta=2)
+                update_job(status="converting", percent=86, stage="Упаковываю FFmpeg…", eta=1)
 
-        dl_opts = {
-            **base_ydl_opts(use_yt_alt_clients=(is_yt_url and actual_url == target_url)),
-            # Предпочитаем форматы, которые FFmpeg копирует без перекодирования за 0.2 сек (MP3 / M4A / AAC)
-            "format": (
-                "bestaudio[ext=mp3][protocol^=http]/"
-                "bestaudio[ext=m4a][protocol^=http]/"
-                "bestaudio[ext=mp3]/"
-                "bestaudio[ext=m4a]/"
-                "bestaudio[acodec^=mp4a]/"
-                "bestaudio/best"
-            ),
-            "outtmpl": str(tmp_dir / "source.%(ext)s"),
-            "concurrent_fragment_downloads": 8,
-            "max_filesize": 100 * 1024 * 1024,
-            "progress_hooks": [on_progress],
-        }
-        try:
-            with yt_dlp.YoutubeDL(dl_opts) as ydl:
-                ydl.download([actual_url])
-        except yt_dlp.utils.DownloadError:
-            raise HTTPException(status_code=502, detail="Не получилось скачать аудиодорожку")
+        def make_dl_opts(use_yt_alt: bool, check_preview: bool) -> dict[str, Any]:
+            def check_entry(entry: dict[str, Any], *, incomplete: bool = False) -> str | None:
+                if entry.get("is_live") or entry.get("live_status") == "is_live":
+                    filter_rejection["reason"] = "live"
+                    return "Прямая трансляция"
+                dur_v = entry.get("duration")
+                if isinstance(dur_v, (int, float)) and dur_v > MAX_DURATION_SEC:
+                    filter_rejection["reason"] = "too_long"
+                    return "Трек слишком длинный"
+                if check_preview and _is_preview_only(entry):
+                    filter_rejection["reason"] = "preview"
+                    return "Только 30с превью"
+                # Метаданные получены — сразу обновляем заголовок и прогресс до 35%
+                p0, t0 = split_artist_title(
+                    str(entry.get("title") or ""),
+                    str(entry.get("channel") or entry.get("uploader") or ""),
+                    artist_meta=entry.get("artist") or entry.get("creator"),
+                    track_meta=entry.get("track"),
+                )
+                update_job(
+                    status="downloading",
+                    percent=35,
+                    stage="Скачиваю аудио…",
+                    title=(title_hint if t0 == "Без названия" and title_hint else t0)[:64],
+                    performer=(performer_hint if p0 == "Неизвестный исполнитель" and performer_hint else p0)[:64],
+                    duration=int(dur_v) if isinstance(dur_v, (int, float)) and dur_v > 0 else 0,
+                    eta=4,
+                )
+                return None
+
+            return {
+                **base_ydl_opts(use_yt_alt_clients=use_yt_alt),
+                "format": (
+                    "bestaudio[ext=mp3][protocol^=http]/"
+                    "bestaudio[ext=m4a][protocol^=http]/"
+                    "bestaudio[ext=mp3]/"
+                    "bestaudio[ext=m4a]/"
+                    "bestaudio[acodec^=mp4a]/"
+                    "bestaudio/best"
+                ),
+                "outtmpl": str(tmp_dir / "source.%(ext)s"),
+                "concurrent_fragment_downloads": 8,
+                "max_filesize": 100 * 1024 * 1024,
+                "match_filter": check_entry,
+                "progress_hooks": [on_progress],
+            }
+
+        if skip_yt_probe:
+            bot_blocked = True
+        else:
+            try:
+                with yt_dlp.YoutubeDL(make_dl_opts(use_yt_alt=is_yt_url, check_preview=not is_yt_url)) as ydl:
+                    extracted = ydl.extract_info(target_url, download=True)
+                    if isinstance(extracted, dict):
+                        info = extracted
+            except yt_dlp.utils.DownloadError as exc:
+                msg = str(exc)
+                if "Sign in" in msg or "bot" in msg.lower() or "403" in msg:
+                    bot_blocked = True
+                    if is_yt_url and not resolve_cookie_file():
+                        _yt_blocked_until = time.monotonic() + 1800
+                elif title_hint or performer_hint:
+                    info = None
+                else:
+                    raise HTTPException(status_code=404, detail="Не удалось получить трек по этой ссылке")
+
+        if filter_rejection.get("reason") == "live":
+            raise HTTPException(status_code=422, detail="Прямые трансляции нельзя скачать как песню")
+        if filter_rejection.get("reason") == "too_long":
+            max_min = MAX_DURATION_SEC // 60
+            raise HTTPException(status_code=422, detail=f"Трек слишком длинный (максимум {max_min} мин)")
 
         audio_files = [
             p for p in tmp_dir.iterdir()
             if p.is_file() and p.name.startswith("source.") and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".part")
         ]
+
+        # Если YouTube заблокировал IP или трек SoundCloud оказался 30с превью — ищем полную копию на SoundCloud
         if not audio_files:
+            p_hint, t_hint = (performer_hint or "").strip(), (title_hint or "").strip()
+            if (not t_hint or not p_hint) and isinstance(info, dict):
+                p2, t2 = split_artist_title(
+                    str(info.get("title") or ""),
+                    str(info.get("channel") or info.get("uploader") or ""),
+                )
+                p_hint = p_hint or p2
+                t_hint = t_hint or t2
+            if (not t_hint or not p_hint) and is_yt_url:
+                oe = _youtube_oembed(target_url)
+                if oe:
+                    p_hint = p_hint or oe[0]
+                    t_hint = t_hint or oe[1]
+            update_job(status="probing", percent=24, stage="Подбираю полную версию…", eta=5)
+            sc_query = f"{p_hint} {t_hint}".strip()
+            sc_entry = _find_soundcloud_full_url(sc_query, exclude_url=target_url, title_only=t_hint) if (sc_query or t_hint) else None
+            if sc_entry and sc_entry.get("webpage_url"):
+                info = sc_entry
+                actual_url = str(sc_entry["webpage_url"])
+                if not title_hint and t_hint:
+                    title_hint = t_hint
+                if not performer_hint and p_hint:
+                    performer_hint = p_hint
+                filter_rejection.clear()
+                dl_started = time.monotonic()
+                try:
+                    with yt_dlp.YoutubeDL(make_dl_opts(use_yt_alt=False, check_preview=False)) as ydl:
+                        ydl.download([actual_url])
+                except yt_dlp.utils.DownloadError:
+                    raise HTTPException(status_code=502, detail="Не получилось скачать аудиодорожку")
+                audio_files = [
+                    p for p in tmp_dir.iterdir()
+                    if p.is_file() and p.name.startswith("source.") and p.suffix.lower() not in (".jpg", ".jpeg", ".png", ".webp", ".part")
+                ]
+            elif bot_blocked:
+                raise HTTPException(
+                    status_code=503,
+                    detail="YouTube ограничил скачивание с облачного сервера, а полной копии на SoundCloud не нашлось. Попробуй другое название.",
+                )
+            elif filter_rejection.get("reason") == "preview":
+                raise HTTPException(status_code=422, detail="Доступно только 30-секундное превью — попробуй другой вариант")
+            else:
+                raise HTTPException(status_code=404, detail="Трек не найден")
+
+        if not audio_files or not isinstance(info, dict):
             raise HTTPException(status_code=502, detail="Аудиофайл не скачался")
         src_audio = audio_files[0]
+
+        dur = info.get("duration")
+        duration = int(dur) if isinstance(dur, (int, float)) and dur > 0 else 0
+        performer, title = split_artist_title(
+            str(info.get("title") or ""),
+            str(info.get("channel") or info.get("uploader") or ""),
+            artist_meta=info.get("artist") or info.get("creator"),
+            track_meta=info.get("track"),
+        )
+        if actual_url != target_url and title_hint and performer_hint:
+            title = title_hint[:64]
+            performer = performer_hint[:64]
+        else:
+            if title_hint and title == "Без названия":
+                title = title_hint[:64]
+            if performer_hint and performer == "Неизвестный исполнитель":
+                performer = performer_hint[:64]
 
         # 3. Быстрая упаковка / конвертация через FFmpeg
         is_copy = src_audio.suffix.lower() in (".mp3", ".m4a", ".aac", ".mp4")
