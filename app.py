@@ -35,7 +35,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, Field
 
-APP_VERSION = "2.0.2"
+APP_VERSION = "2.1.0"
 
 MUSIC_API_SECRET = os.getenv("MUSIC_API_SECRET", "").strip()
 MAX_DURATION_SEC = int(os.getenv("MAX_DURATION_SEC", "1200"))  # 20 минут
@@ -927,6 +927,8 @@ async def health() -> dict[str, Any]:
         "version": APP_VERSION,
         "yt_dlp": yt_dlp.version.__version__,
         "ffmpeg": bool(shutil.which(FFMPEG_BIN)),
+        "deno": bool(shutil.which("deno")),
+        "cookies": bool(resolve_cookie_file()),
     }
 
 
